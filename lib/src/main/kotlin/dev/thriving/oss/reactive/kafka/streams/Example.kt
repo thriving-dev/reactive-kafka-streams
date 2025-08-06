@@ -14,9 +14,15 @@ fun main() {
     )
 
     val builder = ReactiveStreamsBuilder()
-    val stream = builder.stream<String, String>("input-topic")
-        .filter { key, value -> value.length > 3 }
-        .map { key, value -> value.uppercase() }
+    val stream = builder.stream<String?, String?>("input-topic")
+        .filter { key, value ->
+            println("Filtering record: $key -> $value")
+            (value?.length ?: 0) > 3
+        }
+        .map { key, value ->
+            println("Mapping record: $key -> $value")
+            value?.uppercase()
+        }
         .to("output-topic")
 
     val topology = builder.buildTopology()

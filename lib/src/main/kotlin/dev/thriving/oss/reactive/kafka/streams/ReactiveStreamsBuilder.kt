@@ -4,42 +4,68 @@
 package dev.thriving.oss.reactive.kafka.streams
 
 import org.apache.kafka.clients.producer.ProducerConfig
+import org.apache.kafka.common.header.Headers
+import org.apache.kafka.common.header.internals.RecordHeaders
 import org.apache.kafka.common.serialization.StringSerializer
 import reactor.core.Disposable
 import reactor.kafka.receiver.KafkaReceiver
+import reactor.kafka.receiver.ReceiverOffset
 import reactor.kafka.receiver.ReceiverOptions
-import reactor.kafka.receiver.ReceiverRecord
 import reactor.kafka.sender.KafkaSender
 import reactor.kafka.sender.SenderOptions
 import reactor.kafka.sender.SenderRecord
+import java.util.*
 
 class ReactiveStreamsBuilder {
-    private val sources = mutableListOf<ReactiveKStream<*, *>>()
+    private val terminals = mutableListOf<ReactiveKStream<*, *>>()
 
     fun <K, V> stream(topic: String): ReactiveKStream<K, V> {
-        val stream = ReactiveKStream<K, V>(topic)
-        sources.add(stream)
-        return stream
+        return ReactiveKStream(this, topic)
     }
 
-    internal fun buildTopology(): ReactiveTopology {
-        return ReactiveTopology(sources)
+    internal fun register(stream: ReactiveKStream<*, *>) {
+        terminals.add(stream)
+    }
+
+    fun buildTopology(): ReactiveTopology {
+        return ReactiveTopology(terminals)
     }
 }
 
 class ReactiveKStream<K, V> internal constructor(
-    internal val topic: String,
+    private val builder: ReactiveStreamsBuilder,
+    internal val sourceTopic: String,
     internal val operations: List<StreamOperation> = emptyList(),
-    internal val sinkTopic: String? = null
+    internal val sinkTopic: String? = null,
+    internal val isRegistered: Boolean = false // To avoid duplicate registration
 ) {
-    fun filter(predicate: (K, V) -> Boolean): ReactiveKStream<K, V> =
-        ReactiveKStream(topic, operations + StreamOperation.Filter(predicate as (Any?, Any?) -> Boolean), sinkTopic)
+    fun filter(predicate: (K, V) -> Boolean): ReactiveKStream<K, V> {
+        return ReactiveKStream(
+            builder,
+            sourceTopic,
+            operations + StreamOperation.Filter(predicate as (Any?, Any?) -> Boolean),
+            sinkTopic
+        )
+    }
 
-    fun <VR> map(mapper: (K, V) -> VR): ReactiveKStream<K, VR> =
-        ReactiveKStream(topic, operations + StreamOperation.Map(mapper as (Any?, Any?) -> Any?), sinkTopic)
+    fun <VR> map(mapper: (K, V) -> VR): ReactiveKStream<K, VR> {
+        return ReactiveKStream(
+            builder,
+            sourceTopic,
+            operations + StreamOperation.Map(mapper as (Any?, Any?) -> Any?),
+            sinkTopic
+        )
+    }
 
-    fun to(topic: String): ReactiveKStream<K, V> =
-        ReactiveKStream(this.topic, operations, topic)
+    fun to(topic: String) {
+        val terminal = ReactiveKStream<K, V>(
+            builder,
+            sourceTopic,
+            operations,
+            topic
+        )
+        builder.register(terminal)
+    }
 }
 
 sealed class StreamOperation {
@@ -48,7 +74,7 @@ sealed class StreamOperation {
 }
 
 class ReactiveTopology(
-    internal val sources: List<ReactiveKStream<*, *>>
+    internal val pipelines: List<ReactiveKStream<*, *>>
 )
 
 class ReactiveKafkaStreams(
@@ -56,58 +82,64 @@ class ReactiveKafkaStreams(
     private val props: Map<String, Any>
 ) {
     private val subscriptions = mutableListOf<Disposable>()
-    private val sender by lazy {
+    private val sender: KafkaSender<Any?, Any?> by lazy {
         val producerProps = props + mapOf(
             ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG to StringSerializer::class.java,
             ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG to StringSerializer::class.java
         )
-        KafkaSender.create<String, String>(SenderOptions.create(producerProps))
+        KafkaSender.create<Any, Any>(SenderOptions.create(producerProps))
     }
 
     fun start() {
-        // For each source (stream), create a pipeline
-        for (source in topology.sources) {
-            // We'll only support String key/values for now for simplicity
+        for (pipeline in topology.pipelines) {
             val options = ReceiverOptions.create<String, String>(props)
-                .subscription(listOf(source.topic))
-
+                .subscription(listOf(pipeline.sourceTopic))
             val receiver = KafkaReceiver.create(options)
             var flux = receiver.receive()
+                .map { record -> Record<Any?, Any?>(record.key(), record.value(), record.timestamp(), record.headers(), record.receiverOffset()) }
 
-            // Apply filter and map operations
-            for (op in source.operations) {
+            // Chain all operations in order
+            for (op in pipeline.operations) {
                 when (op) {
                     is StreamOperation.Filter -> {
                         @Suppress("UNCHECKED_CAST")
-                        val predicate = op.predicate as (String?, String?) -> Boolean
+                        val predicate = op.predicate
                         flux = flux.filter { record -> predicate(record.key(), record.value()) }
                     }
                     is StreamOperation.Map -> {
                         @Suppress("UNCHECKED_CAST")
-                        val mapper = op.mapper as (String?, String?) -> Any?
+                        val mapper = op.mapper
                         flux = flux.map { record ->
-                            // Only value is mapped for now
+                            // For simplicity, only map value
                             val mapped = mapper(record.key(), record.value())
-                            record // TODO
+                            record.withValue(mapped)
                         }
                     }
                 }
             }
 
-            if (source.sinkTopic != null) {
-                // SINK: Write to another topic
-                val outTopic = source.sinkTopic
+            // SINK: Write to another topic, if specified
+            if (pipeline.sinkTopic != null) {
+                val outTopic = pipeline.sinkTopic
                 val sendFlux = flux.map { record ->
-                    SenderRecord.create(outTopic, null, null, record.key(), record.value(), null)
+                    SenderRecord.create(
+                        outTopic,
+                        null,
+                        record.timestamp(),
+                        record.key(),
+                        record.value(),
+                        record.receiverOffset()
+                    )
                 }
-                val disposable = sender.send(sendFlux)
+                val disposable = sendFlux.`as`(sender::send)
+                    .doOnNext { m -> m.correlationMetadata()?.acknowledge() }
                     .doOnError { e -> println("Send error: $e") }
                     .subscribe { result ->
                         println("Record sent to $outTopic: ${result.correlationMetadata()}")
                     }
                 subscriptions += disposable
             } else {
-                // No sink: Print to stdout (default)
+                // No sink: Print to stdout (for debugging)
                 val disposable = flux.doOnNext { record ->
                     println("Processed record: ${record.key()} -> ${record.value()}")
                 }.subscribe()
@@ -118,5 +150,163 @@ class ReactiveKafkaStreams(
 
     fun close() {
         subscriptions.forEach { it.dispose() }
+        sender.close()
     }
 }
+
+class Record<K, V> @JvmOverloads constructor(
+    private val key: K?,
+    private val value: V?,
+    timestamp: Long,
+    headers: Headers? = null,
+    private val receiverOffset: ReceiverOffset? = null,
+) {
+    private val timestamp: Long
+    private val headers: Headers
+
+    /**
+     * The full constructor, specifying all the attributes of the record.
+     *
+     * Note: this constructor makes a copy of the headers argument.
+     * See [ProcessorContext.forward] for
+     * considerations around mutability of keys, values, and headers.
+     *
+     * @param key The key of the record. May be null.
+     * @param value The value of the record. May be null.
+     * @param timestamp The timestamp of the record. May not be negative.
+     * @param headers The headers of the record. May be null, which will cause subsequent calls
+     * to [.headers] to return a non-null, empty, [Headers] collection.
+     * @throws IllegalArgumentException if the timestamp is negative.
+     * @see ProcessorContext.forward
+     */
+    /**
+     * Convenience constructor in case you do not wish to specify any headers.
+     * Subsequent calls to [.headers] will return a non-null, empty, [Headers] collection.
+     *
+     * @param key The key of the record. May be null.
+     * @param value The value of the record. May be null.
+     * @param timestamp The timestamp of the record. May not be negative.
+     *
+     * @throws IllegalArgumentException if the timestamp is negative.
+     */
+    init {
+        if (timestamp < 0) {
+            throw RuntimeException(
+                "Malformed Record",
+                IllegalArgumentException("Timestamp may not be negative. Got: " + timestamp)
+            )
+        }
+        this.timestamp = timestamp
+        this.headers = RecordHeaders(headers)
+    }
+
+    /**
+     * The key of the record. May be null.
+     */
+    fun key(): K? {
+        return key
+    }
+
+    /**
+     * The value of the record. May be null.
+     */
+    fun value(): V? {
+        return value
+    }
+
+    /**
+     * The timestamp of the record. Will never be negative.
+     */
+    fun timestamp(): Long {
+        return timestamp
+    }
+
+    /**
+     * The headers of the record. Never null.
+     */
+    fun headers(): Headers {
+        return headers
+    }
+
+    fun receiverOffset(): ReceiverOffset? {
+        return receiverOffset
+    }
+
+    /**
+     * A convenient way to produce a new record if you only need to change the key.
+     *
+     * Copies the attributes of this record with the key replaced.
+     *
+     * @param key The key of the result record. May be null.
+     * @param <NewK> The type of the new record's key.
+     * @return A new Record instance with all the same attributes (except that the key is replaced).
+    </NewK> */
+    fun <NewK> withKey(key: NewK?): Record<NewK?, V?> {
+        return Record<NewK?, V?>(key, value, timestamp, headers)
+    }
+
+    /**
+     * A convenient way to produce a new record if you only need to change the value.
+     *
+     * Copies the attributes of this record with the value replaced.
+     *
+     * @param value The value of the result record.
+     * @param <NewV> The type of the new record's value.
+     * @return A new Record instance with all the same attributes (except that the value is replaced).
+    </NewV> */
+    fun <NewV> withValue(value: NewV?): Record<K?, NewV?> {
+        return Record<K?, NewV?>(key, value, timestamp, headers)
+    }
+
+    /**
+     * A convenient way to produce a new record if you only need to change the timestamp.
+     *
+     * Copies the attributes of this record with the timestamp replaced.
+     *
+     * @param timestamp The timestamp of the result record.
+     * @return A new Record instance with all the same attributes (except that the timestamp is replaced).
+     */
+    fun withTimestamp(timestamp: Long): Record<K?, V?> {
+        return Record<K?, V?>(key, value, timestamp, headers)
+    }
+
+    /**
+     * A convenient way to produce a new record if you only need to change the headers.
+     *
+     * Copies the attributes of this record with the headers replaced.
+     * Also makes a copy of the provided headers.
+     *
+     * See [ProcessorContext.forward] for
+     * considerations around mutability of keys, values, and headers.
+     *
+     * @param headers The headers of the result record.
+     * @return A new Record instance with all the same attributes (except that the headers are replaced).
+     */
+    fun withHeaders(headers: Headers?): Record<K?, V?> {
+        return Record<K?, V?>(key, value, timestamp, headers)
+    }
+
+    override fun toString(): String {
+        return "Record{" +
+                "key=" + key +
+                ", value=" + value +
+                ", timestamp=" + timestamp +
+                ", headers=" + headers +
+                '}'
+    }
+
+    override fun equals(o: Any?): Boolean {
+        if (this === o) return true
+        if (o == null || javaClass != o.javaClass) return false
+        val record: Record<*, *> = o as Record<*, *>
+        return timestamp == record.timestamp &&
+                key == record.key &&
+                value == record.value &&
+                headers == record.headers
+    }
+
+    override fun hashCode(): Int {
+        return Objects.hash(key, value, timestamp, headers)
+    }
+}
+
