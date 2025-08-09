@@ -24,6 +24,7 @@ dependencies {
 
     // Reactor Kafka (reactive Kafka client)
     implementation("io.projectreactor.kafka:reactor-kafka:1.3.23")
+    implementation("io.projectreactor.kotlin:reactor-kotlin-extensions:1.2.3")
 
     // Kafka clients (for configuration compatibility)
     implementation("org.apache.kafka:kafka-clients:3.9.1")

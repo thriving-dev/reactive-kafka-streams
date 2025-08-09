@@ -23,8 +23,10 @@ fun main() {
 
     val consumerProps = mapOf(
         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to "localhost:9092",
-        ConsumerConfig.GROUP_ID_CONFIG to "rks-demo-8",
+        ConsumerConfig.GROUP_ID_CONFIG to "rks-demo-13",
         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest",
+        ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG to "3000",
+        ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG to "10000",
         "internal.leave.group.on.close" to "true",
     )
 
