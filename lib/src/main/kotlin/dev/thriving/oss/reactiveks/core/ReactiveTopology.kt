@@ -23,6 +23,22 @@ class FilterNode<K, V>(
     override fun apply(rec: Record<K, V>): Record<K, V>? = if (predicate(rec)) rec else null
 }
 
+class PeekNode<K, V>(
+    id: ProcessorId,
+    private val action: (Record<K, V>) -> Unit
+) : ProcessorNode<K, V, K, V>(id) {
+    override fun apply(rec: Record<K, V>): Record<K, V>? {
+        try {
+            action(rec)        // side-effect only
+        } catch (e: Throwable) {
+            // Don't kill the stream because of peek side-effects
+            // Replace with proper logging if you have one
+            println("[rks] peek error: ${e.message}")
+        }
+        return rec            // pass-through unchanged
+    }
+}
+
 data class SourceNode<K, V>(
     val id: SourceId,
     val topic: String

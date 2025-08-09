@@ -8,19 +8,22 @@ fun main() {
 
     builder
         .stream<String, ByteArray>("input-topic")
-        .filter { rec -> rec.value != null && rec.value.isNotEmpty() }
+        .peek { r -> println("[peek in] key=${r.key} val=${r.value?.decodeToString()}") }
+        .filter { rec ->
+            rec.value != null && rec.value.decodeToString().length > 3 }
         .map { rec ->
             // example: pass-through key, uppercase value
             val newVal = rec.value!!.map { b -> b.toInt().toChar() }.joinToString("").uppercase().toByteArray()
             Record(rec.key, newVal, timestamp = rec.timestamp)
         }
+        .peek { r -> println("[peek out] key=${r.key} val=${r.value?.decodeToString()}") }
         .to(topic = "output-topic", builder = builder)
 
     val topology = builder.build()
 
     val consumerProps = mapOf(
         ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG to "localhost:9092",
-        ConsumerConfig.GROUP_ID_CONFIG to "rks-demo-5",
+        ConsumerConfig.GROUP_ID_CONFIG to "rks-demo-8",
         ConsumerConfig.AUTO_OFFSET_RESET_CONFIG to "earliest",
         "internal.leave.group.on.close" to "true",
     )

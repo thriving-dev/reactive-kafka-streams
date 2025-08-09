@@ -35,6 +35,11 @@ class ReactiveKStream<K, V> internal constructor(
         return ReactiveKStream(source as SourceNode<K2, V2>, steps)
     }
 
+    fun peek(action: (Record<K, V>) -> Unit): ReactiveKStream<K, V> {
+        steps += PeekNode<K, V>(ProcessorId("peek-${steps.size + 1}"), action)
+        return this
+    }
+
     fun to(topic: String, builder: ReactiveStreamsBuilder) {
         val sink = SinkNode<K, V>(SinkId("sink-$topic"), topic)
         builder.registerChain(
